@@ -1,6 +1,8 @@
 package chart
 
 import (
+	"flag"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -8,14 +10,23 @@ import (
 	v1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/yaml"
 	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/assert"
+	testifyAssert "github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/klog/v2"
 )
 
 func init() {
 	logrus.SetLevel(logrus.DebugLevel)
+	fs := &flag.FlagSet{}
+	klog.InitFlags(fs)
+	if err := fs.Set("logtostderr", "true"); err != nil {
+		panic(err)
+	}
+	if err := fs.Set("v", "1000"); err != nil {
+		panic(err)
+	}
 }
 
 func TestHashObjects(t *testing.T) {
@@ -67,13 +78,14 @@ func TestHashObjects(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			assert := assert.New(t)
+			assert := testifyAssert.New(t)
 			chart := NewChart()
 			config := &v1.HelmChartConfig{}
 			chart.Spec.ValuesContent = test.chartValuesContent
 			config.Spec.ValuesContent = test.configValuesContent
 
-			job, secret, configMap := job(chart, "6443")
+			job, secret, configMap, err := buildJob(chart, "6443")
+			assert.NoError(err)
 			objects := []metav1.Object{configMap, secret}
 
 			valuesSecretAddConfig(job, secret, config)
@@ -98,7 +110,7 @@ func TestHashObjects(t *testing.T) {
 }
 
 func TestSetVals(t *testing.T) {
-	assert := assert.New(t)
+	assert := testifyAssert.New(t)
 	tests := map[string]bool{
 		"":      false,
 		" ":     false,
@@ -122,33 +134,37 @@ func TestSetVals(t *testing.T) {
 }
 
 func TestInstallJob(t *testing.T) {
-	assert := assert.New(t)
+	assert := testifyAssert.New(t)
 	chart := NewChart()
-	job, _, _ := job(chart, "6443")
+	job, _, _, err := buildJob(chart, "6443")
+	assert.NoError(err)
 	assert.Equal("helm-install-traefik", job.Name)
 	assert.Equal(DefaultJobImage, job.Spec.Template.Spec.Containers[0].Image)
 	assert.Equal("helm-traefik", job.Spec.Template.Spec.ServiceAccountName)
 }
 
 func TestDeleteJob(t *testing.T) {
-	assert := assert.New(t)
+	assert := testifyAssert.New(t)
 	chart := NewChart()
 	deleteTime := metav1.NewTime(time.Time{})
 	chart.DeletionTimestamp = &deleteTime
-	job, _, _ := job(chart, "6443")
+	job, _, _, err := buildJob(chart, "6443")
+	assert.NoError(err)
+
 	assert.Equal("helm-delete-traefik", job.Name)
 }
 
 func TestInstallJobImage(t *testing.T) {
-	assert := assert.New(t)
+	assert := testifyAssert.New(t)
 	chart := NewChart()
 	chart.Spec.JobImage = "custom-job-image"
-	job, _, _ := job(chart, "6443")
+	job, _, _, err := buildJob(chart, "6443")
+	assert.NoError(err)
 	assert.Equal("custom-job-image", job.Spec.Template.Spec.Containers[0].Image)
 }
 
 func TestInstallArgs(t *testing.T) {
-	assert := assert.New(t)
+	assert := testifyAssert.New(t)
 	stringArgs := strings.Join(args(NewChart()), " ")
 	assert.Equal("install "+
 		"--set-string acme.dnsProvider.name=cloudflare "+
@@ -160,12 +176,56 @@ func TestInstallArgs(t *testing.T) {
 }
 
 func TestDeleteArgs(t *testing.T) {
-	assert := assert.New(t)
+	assert := testifyAssert.New(t)
 	chart := NewChart()
 	deleteTime := metav1.NewTime(time.Time{})
 	chart.DeletionTimestamp = &deleteTime
 	stringArgs := strings.Join(args(chart), " ")
 	assert.Equal("delete", stringArgs)
+}
+
+func TestViaEnv(t *testing.T) {
+	assert := testifyAssert.New(t)
+
+	chart := NewChart()
+	myJobImage := "custom-job-image"
+	// language=yaml
+	txt := `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "{{ .name }}"
+  namespace: "{{ .namespace }}"
+  labels: {{ .labels | toJSON }}
+spec:
+  template:
+    metadata:
+      labels: {{ .labels | toJSON }}
+    spec:
+      containers:
+        - name: "{{ .containerName }}"
+          # image: "{{ .image }}"
+          image: "custom-job-image"
+          args: {{ .args | toJSON }}
+          volumeMounts:
+            - { name: extra mount, mountPath: /foo/404, readOnly: true }
+          {{ range .volumeMounts }}
+            - {{ . | toJSON }}
+          {{ end }}
+      serviceAccountName: "{{ .serviceAccountName }}"
+      # wholesale copy theirs
+      volumes: {{ .volumes | toJSON }}
+`
+	if setErr := os.Setenv("JOB_SPEC_TEMPLATE", txt); setErr != nil {
+		assert.NoError(setErr)
+	}
+	job, _, _, err := buildJob(chart, "6443")
+	assert.NoError(err)
+	assert.Equal(myJobImage, job.Spec.Template.Spec.Containers[0].Image)
+	assert.Equal(chart.Namespace, job.Namespace)
+	if setErr := os.Setenv("JOB_SPEC_TEMPLATE", ""); setErr != nil {
+		assert.NoError(setErr)
+	}
 }
 
 func NewChart() *v1.HelmChart {

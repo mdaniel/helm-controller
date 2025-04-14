@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/k3s-io/helm-controller/pkg/controllers/chart"
@@ -78,12 +79,15 @@ func Register(ctx context.Context, systemNamespace, controllerName string, cfg c
 		chart.DefaultJobImage = opts.DefaultJobImage
 	}
 
+	apiServerPort := "6443"
+	if envPort := os.Getenv("API_SERVER_PORT"); envPort != "" {
+		apiServerPort = envPort
+	}
 	chart.Register(ctx,
 		systemNamespace,
 		controllerName,
 		opts.JobClusterRole,
-		"6443",
-		appCtx.K8s,
+		apiServerPort,
 		appCtx.Apply,
 		recorder,
 		appCtx.HelmChart(),
@@ -122,6 +126,7 @@ func Register(ctx context.Context, systemNamespace, controllerName string, cfg c
 }
 
 func controllerFactory(rest *rest.Config) (controller.SharedControllerFactory, error) {
+	// we can't fix this deprecation until SharedControllerFactoryOptions is fixed
 	rateLimit := workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 60*time.Second)
 	clientFactory, err := client.NewSharedClientFactory(rest, nil)
 	if err != nil {

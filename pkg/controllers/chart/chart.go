@@ -1,6 +1,7 @@
 package chart
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"text/template"
 	"time"
 
 	v1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
@@ -29,19 +31,19 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
+	k8yaml "sigs.k8s.io/yaml"
 )
 
 const (
-	Label         = "helmcharts.helm.cattle.io/chart"
-	Annotation    = "helmcharts.helm.cattle.io/configHash"
-	Unmanaged     = "helmcharts.helm.cattle.io/unmanaged"
-	SecretType    = "helmcharts.helm.cattle.io/values"
-	ManagedBy     = "helmcharts.cattle.io/managed-by"
-	CRDName       = "helmcharts.helm.cattle.io"
-	ConfigCRDName = "helmchartconfigs.helm.cattle.io"
+	Label      = "helmcharts.helm.cattle.io/chart"
+	Annotation = "helmcharts.helm.cattle.io/configHash"
+	Unmanaged  = "helmcharts.helm.cattle.io/unmanaged"
+	SecretType = "helmcharts.helm.cattle.io/values"
+	ManagedBy  = "helmcharts.cattle.io/managed-by"
+	CRDName    = "helmcharts.helm.cattle.io"
 
 	TaintExternalCloudProvider = "node.cloudprovider.kubernetes.io/uninitialized"
 	LabelNodeRolePrefix        = "node-role.kubernetes.io/"
@@ -49,7 +51,6 @@ const (
 	LabelEtcdSuffix            = "etcd"
 
 	FailurePolicyReinstall = "reinstall"
-	FailurePolicyAbort     = "abort"
 
 	chartBySecretIndex       = "helmcharts.helm.cattle.io/chart-by-secret"
 	chartConfigBySecretIndex = "helmcharts.helm.cattle.io/chartconfig-by-secret"
@@ -101,7 +102,6 @@ func Register(
 	managedBy,
 	jobClusterRole string,
 	apiServerPort string,
-	k8s kubernetes.Interface,
 	apply apply.Apply,
 	recorder record.EventRecorder,
 	helms helmcontroller.HelmChartController,
@@ -167,7 +167,7 @@ func Register(
 			}
 			return c.shouldManage(helmChart)
 		},
-		generic.FromObjectHandlerToHandler(generic.ObjectHandler[*v1.HelmChart](c.OnRemove)),
+		generic.FromObjectHandlerToHandler(c.OnRemove),
 	)
 
 	relatedresource.Watch(ctx, "resolve-helm-chart-owned-resources",
@@ -177,7 +177,7 @@ func Register(
 	)
 }
 
-func (c *Controller) jobPatcher(namespace, name string, pt types.PatchType, data []byte) (runtime.Object, error) {
+func (c *Controller) jobPatcher(namespace, name string, _ types.PatchType, _ []byte) (runtime.Object, error) {
 	err := c.jobs.Delete(namespace, name, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
 	if err == nil || apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("create or replace job")
@@ -185,7 +185,7 @@ func (c *Controller) jobPatcher(namespace, name string, pt types.PatchType, data
 	return nil, err
 }
 
-func (c *Controller) resolveHelmChartFromHelmChartConfig(namespace, name string, obj runtime.Object) ([]relatedresource.Key, error) {
+func (c *Controller) resolveHelmChartFromHelmChartConfig(namespace, _ string, obj runtime.Object) ([]relatedresource.Key, error) {
 	if len(c.systemNamespace) > 0 && namespace != c.systemNamespace {
 		// do nothing if it's not in the namespace this controller was registered with
 		return nil, nil
@@ -211,7 +211,7 @@ func (c *Controller) resolveHelmChartFromHelmChartConfig(namespace, name string,
 	return nil, nil
 }
 
-func (c *Controller) resolveHelmChartFromSecret(namespace, name string, obj runtime.Object) ([]relatedresource.Key, error) {
+func (c *Controller) resolveHelmChartFromSecret(namespace, _ string, obj runtime.Object) ([]relatedresource.Key, error) {
 	if len(c.systemNamespace) > 0 && namespace != c.systemNamespace {
 		// do nothing if it's not in the namespace this controller was registered with
 		return nil, nil
@@ -232,7 +232,7 @@ func (c *Controller) resolveHelmChartFromSecret(namespace, name string, obj runt
 	return nil, nil
 }
 
-func (c *Controller) resolveHelmChartConfigFromSecret(namespace, name string, obj runtime.Object) ([]relatedresource.Key, error) {
+func (c *Controller) resolveHelmChartConfigFromSecret(namespace, _ string, obj runtime.Object) ([]relatedresource.Key, error) {
 	if len(c.systemNamespace) > 0 && namespace != c.systemNamespace {
 		// do nothing if it's not in the namespace this controller was registered with
 		return nil, nil
@@ -449,10 +449,13 @@ func (c *Controller) getJobAndRelatedResources(chart *v1.HelmChart) (*batch.Job,
 	}
 
 	// get the default job and configmaps
-	job, valuesSecret, contentConfigMap := job(chart, c.apiServerPort)
+	job, valuesSecret, contentConfigMap, jobErr := buildJob(chart, c.apiServerPort)
+	if jobErr != nil {
+		return nil, nil, jobErr
+	}
 	objects := []metav1.Object{contentConfigMap, valuesSecret}
 
-	// make sure that changes to HelmChart ValuesSecrets triger change to hash
+	// make sure that changes to HelmChart ValuesSecrets trigger change to hash
 	for _, secret := range chart.Spec.ValuesSecrets {
 		if !secret.IgnoreUpdates && secret.Name != "chart-values-"+chart.Name {
 			if s, err := c.secretCache.Get(chart.Namespace, secret.Name); err == nil {
@@ -477,7 +480,7 @@ func (c *Controller) getJobAndRelatedResources(chart *v1.HelmChart) (*batch.Job,
 			failurePolicy = config.Spec.FailurePolicy
 		}
 
-		// make sure that changes to HelmChart ValuesSecrets triger change to hash
+		// make sure that changes to HelmChart ValuesSecrets trigger change to hash
 		for _, secret := range config.Spec.ValuesSecrets {
 			if !secret.IgnoreUpdates && secret.Name != "chart-values-"+config.Name {
 				if s, err := c.secretCache.Get(chart.Namespace, secret.Name); err == nil {
@@ -522,166 +525,11 @@ func chartConfigBySecret(conf *v1.HelmChartConfig) ([]string, error) {
 	return keys.UnsortedList(), nil
 }
 
-func job(chart *v1.HelmChart, apiServerPort string) (*batch.Job, *corev1.Secret, *corev1.ConfigMap) {
-	jobImage := strings.TrimSpace(chart.Spec.JobImage)
-	if jobImage == "" {
-		jobImage = DefaultJobImage
+func buildJob(chart *v1.HelmChart, apiServerPort string) (*batch.Job, *corev1.Secret, *corev1.ConfigMap, error) {
+	job, err := newJob(chart)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-
-	action := "install"
-	if chart.DeletionTimestamp != nil {
-		action = "delete"
-	}
-
-	targetNamespace := chart.Namespace
-	if len(chart.Spec.TargetNamespace) != 0 {
-		targetNamespace = chart.Spec.TargetNamespace
-	}
-
-	chartName := chart.Spec.Chart
-	if chart.Spec.Repo != "" {
-		chartName = chart.Name + "/" + chart.Spec.Chart
-	}
-
-	podSecurityContext := defaultPodSecurityContext.DeepCopy()
-	securityContext := defaultSecurityContext.DeepCopy()
-
-	job := &batch.Job{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "batch/v1",
-			Kind:       "Job",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("helm-%s-%s", action, chart.Name),
-			Namespace: chart.Namespace,
-			Labels: map[string]string{
-				Label: chart.Name,
-			},
-		},
-		Spec: batch.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{},
-					Labels: map[string]string{
-						Label: chart.Name,
-					},
-				},
-				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
-					Containers: []corev1.Container{
-						{
-							Name:            "helm",
-							Image:           jobImage,
-							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args:            args(chart),
-							Env: []corev1.EnvVar{
-								{
-									Name:  "NAME",
-									Value: chart.Name,
-								},
-								{
-									Name:  "VERSION",
-									Value: chart.Spec.Version,
-								},
-								{
-									Name:  "REPO",
-									Value: chart.Spec.Repo,
-								},
-								{
-									Name:  "HELM_DRIVER",
-									Value: "secret",
-								},
-								{
-									Name:  "CHART_NAMESPACE",
-									Value: chart.Namespace,
-								},
-								{
-									Name:  "CHART",
-									Value: chartName,
-								},
-								{
-									Name:  "HELM_VERSION",
-									Value: chart.Spec.HelmVersion,
-								},
-								{
-									Name:  "TARGET_NAMESPACE",
-									Value: targetNamespace,
-								},
-								{
-									Name:  "AUTH_PASS_CREDENTIALS",
-									Value: fmt.Sprintf("%t", chart.Spec.AuthPassCredentials),
-								},
-								{
-									Name:  "INSECURE_SKIP_TLS_VERIFY",
-									Value: fmt.Sprintf("%t", chart.Spec.InsecureSkipTLSVerify),
-								},
-								{
-									Name:  "PLAIN_HTTP",
-									Value: fmt.Sprintf("%t", chart.Spec.PlainHTTP),
-								},
-							},
-							SecurityContext: securityContext,
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "klipper-helm",
-									MountPath: "/home/klipper-helm/.helm",
-								},
-								{
-									Name:      "klipper-cache",
-									MountPath: "/home/klipper-helm/.cache",
-								},
-								{
-									Name:      "klipper-config",
-									MountPath: "/home/klipper-helm/.config",
-								},
-								{
-									Name:      "tmp",
-									MountPath: "/tmp",
-								},
-							},
-						},
-					},
-					ServiceAccountName: fmt.Sprintf("helm-%s", chart.Name),
-					SecurityContext:    podSecurityContext,
-					Volumes: []corev1.Volume{
-						{
-							Name: "klipper-helm",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{
-									Medium: "Memory",
-								},
-							},
-						},
-						{
-							Name: "klipper-cache",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{
-									Medium: "Memory",
-								},
-							},
-						},
-						{
-							Name: "klipper-config",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{
-									Medium: "Memory",
-								},
-							},
-						},
-						{
-							Name: "tmp",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{
-									Medium: "Memory",
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
 	if chart.Spec.Timeout != nil {
 		job.Spec.Template.Spec.Containers[0].Env = append(job.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
 			Name:  "TIMEOUT",
@@ -746,7 +594,252 @@ func job(chart *v1.HelmChart, apiServerPort string) (*batch.Job, *corev1.Secret,
 	valuesSecret := setValuesSecret(job, chart)
 	contentConfigMap := setContentConfigMap(job, chart)
 
-	return job, valuesSecret, contentConfigMap
+	return job, valuesSecret, contentConfigMap, nil
+}
+
+func newJob(chart *v1.HelmChart) (*batch.Job, error) {
+	jobImage := strings.TrimSpace(chart.Spec.JobImage)
+	if jobImage == "" {
+		jobImage = DefaultJobImage
+	}
+
+	action := "install"
+	if chart.DeletionTimestamp != nil {
+		action = "delete"
+	}
+
+	targetNamespace := chart.Namespace
+	if len(chart.Spec.TargetNamespace) != 0 {
+		targetNamespace = chart.Spec.TargetNamespace
+	}
+
+	chartName := chart.Spec.Chart
+	if chart.Spec.Repo != "" {
+		chartName = chart.Name + "/" + chart.Spec.Chart
+	}
+
+	podSecurityContext := defaultPodSecurityContext.DeepCopy()
+	securityContext := defaultSecurityContext.DeepCopy()
+
+	envArray := []corev1.EnvVar{
+		{
+			Name:  "NAME",
+			Value: chart.Name,
+		},
+		{
+			Name:  "VERSION",
+			Value: chart.Spec.Version,
+		},
+		{
+			Name:  "REPO",
+			Value: chart.Spec.Repo,
+		},
+		{
+			Name:  "HELM_DRIVER",
+			Value: "secret",
+		},
+		{
+			Name:  "CHART_NAMESPACE",
+			Value: chart.Namespace,
+		},
+		{
+			Name:  "CHART",
+			Value: chartName,
+		},
+		{
+			Name:  "HELM_VERSION",
+			Value: chart.Spec.HelmVersion,
+		},
+		{
+			Name:  "TARGET_NAMESPACE",
+			Value: targetNamespace,
+		},
+		{
+			Name:  "AUTH_PASS_CREDENTIALS",
+			Value: fmt.Sprintf("%t", chart.Spec.AuthPassCredentials),
+		},
+		{
+			Name:  "INSECURE_SKIP_TLS_VERIFY",
+			Value: fmt.Sprintf("%t", chart.Spec.InsecureSkipTLSVerify),
+		},
+		{
+			Name:  "PLAIN_HTTP",
+			Value: fmt.Sprintf("%t", chart.Spec.PlainHTTP),
+		},
+	}
+	volumesArray := []corev1.Volume{
+		{
+			Name: "klipper-helm",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium: "Memory",
+				},
+			},
+		},
+		{
+			Name: "klipper-cache",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium: "Memory",
+				},
+			},
+		},
+		{
+			Name: "klipper-config",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium: "Memory",
+				},
+			},
+		},
+		{
+			Name: "tmp",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium: "Memory",
+				},
+			},
+		},
+	}
+	volumeMountArray := []corev1.VolumeMount{
+		{
+			Name:      "klipper-helm",
+			MountPath: "/home/klipper-helm/.helm",
+		},
+		{
+			Name:      "klipper-cache",
+			MountPath: "/home/klipper-helm/.cache",
+		},
+		{
+			Name:      "klipper-config",
+			MountPath: "/home/klipper-helm/.config",
+		},
+		{
+			Name:      "tmp",
+			MountPath: "/tmp",
+		},
+	}
+	containerName := "helm"
+
+	jobName := fmt.Sprintf("helm-%s-%s", action, chart.Name)
+	jobLabels := map[string]string{
+		Label: chart.Name,
+	}
+	jobServiceAccountName := fmt.Sprintf("helm-%s", chart.Name)
+
+	if txt := os.Getenv("JOB_SPEC_TEMPLATE"); txt != "" {
+		klog.V(4).Info("Using JobSpec defined in $JOB_SPEC_TEMPLATE")
+		jobTemplate, tErr := prepareTemplate()
+		if tErr != nil {
+			return nil, tErr
+		}
+		jobTemplate, tErr = jobTemplate.Parse(txt)
+		if tErr != nil {
+			klog.Errorf("Parse did not shake out: %+v", tErr)
+			return nil, tErr
+		}
+
+		data := map[string]interface{}{
+			"action":             action,
+			"chart":              chart,
+			"args":               args(chart),
+			"containerName":      containerName,
+			"env":                envArray,
+			"labels":             jobLabels,
+			"image":              jobImage,
+			"name":               jobName,
+			"namespace":          targetNamespace,
+			"serviceAccountName": jobServiceAccountName,
+			"volumes":            volumesArray,
+			"volumeMounts":       volumeMountArray,
+		}
+
+		theJob := &batch.Job{}
+		{
+			buf := new(bytes.Buffer)
+			if tErr := jobTemplate.Execute(buf, data); tErr != nil {
+				return nil, tErr
+			}
+			yamlBytes := buf.Bytes()
+			if klog.V(4).Enabled() {
+				jsonBytes, _ := k8yaml.YAMLToJSON(yamlBytes)
+				prettyYamlBytes, _ := k8yaml.JSONToYAML(jsonBytes)
+				klog.V(4).Infof("base JobSpec yaml:\n%s", string(prettyYamlBytes))
+			}
+			if err := k8yaml.UnmarshalStrict(yamlBytes, theJob); err != nil {
+				klog.Errorf("Unable to serialize value %+v: %+v", theJob, err)
+				return nil, err
+			}
+		}
+		return theJob, nil
+	}
+
+	job := &batch.Job{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: chart.Namespace,
+			Labels:    jobLabels,
+		},
+		Spec: batch.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{},
+					Labels:      jobLabels,
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers: []corev1.Container{
+						{
+							Name:            containerName,
+							Image:           jobImage,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Args:            args(chart),
+							Env:             envArray,
+							SecurityContext: securityContext,
+							VolumeMounts:    volumeMountArray,
+						},
+					},
+					ServiceAccountName: jobServiceAccountName,
+					SecurityContext:    podSecurityContext,
+					Volumes:            volumesArray,
+				},
+			},
+		},
+	}
+	return job, nil
+}
+
+func prepareTemplate() (*template.Template, error) {
+	templateFuncs := template.FuncMap{
+		"toJSON": func(v interface{}) (string, error) {
+			var err error
+			var yamlBytes []byte
+			if yamlBytes, err = k8yaml.Marshal(v); err != nil {
+				klog.Errorf("Unable to serialize value %+v: %+v", v, err)
+				return "", err
+			}
+			var jsonBytes []byte
+			if jsonBytes, err = k8yaml.YAMLToJSON(yamlBytes); err != nil {
+				return "", err
+			}
+			return string(jsonBytes), nil
+		},
+		"toYAML": func(v interface{}) (string, error) {
+			var err error
+			var yamlBytes []byte
+			if yamlBytes, err = k8yaml.Marshal(v); err != nil {
+				klog.Errorf("Unable to serialize value %+v: %+v", v, err)
+				return "", err
+			}
+			return string(yamlBytes), nil
+		},
+	}
+	return template.New("jobSpecTemplate").
+		Funcs(templateFuncs), nil
 }
 
 func valuesSecret(chart *v1.HelmChart) *corev1.Secret {
